@@ -1,57 +1,42 @@
-/* Voice-moderation module for Discord bot (Node.js / ES modules) */
-import { spawn } from 'child_process';
+import 'dotenv/config';
+import { Client, GatewayIntentBits } from 'discord.js';
+import { joinVoiceChannel } from '@discordjs/voice';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { pipeline } from 'stream/promises';
+import { spawn } from 'child_process';
 import prism from 'prism-media';
-import { 
-  joinVoiceChannel,
-  EndBehaviorType,
-  entersState,
-  VoiceConnectionStatus
-} from '@discordjs/voice';
 
-// CONFIG - adjust to your setup:
-const WHISPER_CLI = process.env.WHISPER_CLI || './build/bin/whisper-cli'; // path to whisper.cpp CLI
-const WHISPER_MODEL = process.env.WHISPER_MODEL || 'small'; // or 'base.en', etc. (how you downloaded it)
-const MUTED_ROLE_ID = '1404284095164448810';
+// --- Voice moderation code starts here ---
+
+const WHISPER_CLI = process.env.WHISPER_CLI || '/opt/whisper.cpp/build/bin/whisper-cli';
+const MUTED_ROLE_ID = '1404284095164448810'; // your muted role id
 const TRANSCRIPT_TMP_DIR = path.join(os.tmpdir(), 'vc-moderation');
+const BANNED_WORDS = ['examplebadword', 'swear1', 'swear2']; // replace with your banned words
 
-// Make sure tmp dir exists
 if (!fs.existsSync(TRANSCRIPT_TMP_DIR)) fs.mkdirSync(TRANSCRIPT_TMP_DIR, { recursive: true });
-
-// A small banned-words list for demo (lowercase). Replace with your list.
-const BANNED_WORDS = ['examplebadword', 'swear1', 'swear2']; // put lower-case words
 
 function containsBannedWord(transcript) {
   const t = transcript.toLowerCase();
   for (const w of BANNED_WORDS) {
-    // match whole words (basic)
     const re = new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}\\b`, 'i');
     if (re.test(t)) return w;
   }
   return null;
 }
 
-/** recordSingleUser: subscribe to a user's audio, write WAV, run whisper, return transcript */
 async function recordSingleUser(voiceConnection, userId, guild, onTranscript) {
   try {
     const receiver = voiceConnection.receiver;
 
-    // Subscribe to this user's Opus stream. We'll end after silence by EndBehaviorType
     const opusStream = receiver.subscribe(userId, {
-      end: {
-        behavior: EndBehaviorType.AfterSilence,
-        duration: 1200 // ms silence before closing chunk
-      }
+      end: { behavior: prism.EndBehaviorType.AfterSilence, duration: 1200 }
     });
 
-    // Prism decode Opus -> PCM s16le @ 48000 (Discord uses 48k)
     const opusDecoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 });
 
-    // Prepare ffmpeg to convert 48k stereo s16le -> 16k mono wav file (whisper.cpp needs 16k 16-bit)
     const tmpFile = path.join(TRANSCRIPT_TMP_DIR, `vc_${Date.now()}_${userId}.wav`);
+
     const ffmpeg = spawn('ffmpeg', [
       '-f', 's16le',
       '-ar', '48000',
@@ -61,100 +46,81 @@ async function recordSingleUser(voiceConnection, userId, guild, onTranscript) {
       '-ac', '1',
       '-y',
       tmpFile
-    ], { stdio: ['pipe','ignore','inherit'] });
+    ], { stdio: ['pipe', 'ignore', 'inherit'] });
 
-    // Pipe Opus -> OpusDecoder -> ffmpeg.stdin
     opusStream.pipe(opusDecoder).pipe(ffmpeg.stdin);
 
-    // Wait for the ffmpeg process to finish (the opus stream will close on silence)
     await new Promise((resolve, reject) => {
-      ffmpeg.on('close', code => {
-        if (code === 0) resolve();
-        else reject(new Error(`ffmpeg exited with ${code}`));
-      });
+      ffmpeg.on('close', code => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited with code ${code}`))));
       ffmpeg.on('error', reject);
     });
 
-    // Now run whisper.cpp CLI on the WAV file
-    // whisper-cli -m models/ggml-small.bin -f file.wav  (adjust your paths/model)
-    // You should have a script or path that knows the model location.
-    const whisperArgs = ['-f', tmpFile, /* optionally other flags */];
-    // If your whisper binary requires model flag, add it, e.g. ['-m','models/ggml-small.bin','-f', tmpFile]
-    const whisper = spawn(WHISPER_CLI, whisperArgs);
+    // Run whisper CLI
+    const whisper = spawn(WHISPER_CLI, ['-f', tmpFile]);
 
     let out = '';
     whisper.stdout.on('data', d => { out += d.toString(); });
-    whisper.stderr.on('data', d => { /* whisper prints progress to stderr — ignore or capture */ });
+    whisper.stderr.on('data', () => {}); // ignore progress output
 
     await new Promise((resolve, reject) => {
-      whisper.on('close', code => (code === 0) ? resolve() : reject(new Error(`whisper exited ${code}`)));
+      whisper.on('close', code => (code === 0 ? resolve() : reject(new Error(`whisper exited with code ${code}`))));
       whisper.on('error', reject);
     });
 
-    // whisper-cli usually prints the transcription text on stdout (depends on your build/options)
     const transcript = out.trim();
-    // call the handler
     await onTranscript(transcript, userId, tmpFile);
 
   } catch (err) {
     console.error('recordSingleUser error:', err);
-  } finally {
-    // cleanup file(s) optionally
-    // fs.unlinkSync(tmpFile) try/catch if you want
   }
 }
 
-/** startListeningOnConnection: wire speaking start -> create recording */
 function startListeningOnConnection(voiceConnection, guild) {
-  // `receiver.speaking` or `voiceConnection.receiver.speaking` emits when a user starts/stops
   const receiver = voiceConnection.receiver;
 
   receiver.speaking.on('start', userId => {
-    // Avoid recording bots
     if (userId === voiceConnection.joinConfig?.selfDeaf) return;
 
-    // Start recording and transcribing this user's speech chunk
-    recordSingleUser(voiceConnection, userId, guild, async (transcript, userId, tmpFile) => {
+    recordSingleUser(voiceConnection, userId, guild, async (transcript, userId) => {
       if (!transcript) return;
+
       console.log(`Transcribed for ${userId}:`, transcript);
 
       const matched = containsBannedWord(transcript);
       if (!matched) return;
 
-      // Fetch guild member and apply muted role
       try {
         const member = await guild.members.fetch(userId);
         if (!member) return;
 
-        // check bot can manage role
-        const botMember = guild.members.me; // discord.js v14+
+        const botMember = guild.members.me;
         const mutedRole = guild.roles.cache.get(MUTED_ROLE_ID);
         if (!mutedRole) {
-          console.warn('Muted role not found:', MUTED_ROLE_ID); return;
+          console.warn('Muted role not found');
+          return;
         }
         if (botMember.roles.highest.position <= mutedRole.position) {
-          console.warn('Bot role too low to manage muted role');
+          console.warn('Bot role too low to assign muted role');
           return;
         }
 
-        // if member already has it, skip
         if (!member.roles.cache.has(MUTED_ROLE_ID)) {
           await member.roles.add(MUTED_ROLE_ID, `Auto-muted for saying banned word: ${matched}`);
         }
 
-        // DM the user (best effort)
         try {
-          await member.send(`You have been muted for saying "${matched}" in voice chat. You will be unmuted in 10 minutes.`).catch(()=>{});
+          await member.send(`You have been muted for saying "${matched}" in voice chat. You will be unmuted in 10 minutes.`).catch(() => {});
         } catch {}
 
-        // Schedule unmute in 10 minutes (600000 ms)
         setTimeout(async () => {
           try {
             const refreshed = await guild.members.fetch(userId);
             if (refreshed && refreshed.roles.cache.has(MUTED_ROLE_ID)) {
               await refreshed.roles.remove(MUTED_ROLE_ID, 'Auto-unmute after timeout');
             }
-          } catch (e) { console.error('Error unmuting:', e); }
+          } catch (e) {
+            console.error('Error unmuting:', e);
+          }
         }, 10 * 60 * 1000);
       } catch (e) {
         console.error('Error applying mute role:', e);
@@ -163,13 +129,66 @@ function startListeningOnConnection(voiceConnection, guild) {
   });
 }
 
-/** Example: call this when you rightfully join voice with joinVoiceChannel(...) */
 async function attachModerationToConnection(voiceConnection) {
   try {
     const guildId = voiceConnection.joinConfig.guildId;
     const guild = await voiceConnection.client.guilds.fetch(guildId);
     startListeningOnConnection(voiceConnection, guild);
   } catch (e) {
-    console.error('attachModerationToConnection error', e);
+    console.error('attachModerationToConnection error:', e);
   }
 }
+
+// --- Voice moderation code ends here ---
+
+// --- Bot setup ---
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers
+  ]
+});
+
+const GUILD_ID = process.env.GUILD_ID;
+const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+
+if (!DISCORD_TOKEN || !GUILD_ID || !VOICE_CHANNEL_ID) {
+  console.error('Missing DISCORD_TOKEN, GUILD_ID, or VOICE_CHANNEL_ID environment variables');
+  process.exit(1);
+}
+
+client.once('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const voiceChannel = await guild.channels.fetch(VOICE_CHANNEL_ID);
+
+    if (!voiceChannel.isVoiceBased()) {
+      console.error('Provided channel is not a voice channel');
+      process.exit(1);
+    }
+
+    const connection = joinVoiceChannel({
+      channelId: VOICE_CHANNEL_ID,
+      guildId: GUILD_ID,
+      adapterCreator: guild.voiceAdapterCreator,
+      selfDeaf: false,
+      selfMute: false,
+    });
+
+    await attachModerationToConnection(connection);
+
+    console.log('Voice moderation attached and listening!');
+  } catch (err) {
+    console.error('Error joining voice channel:', err);
+  }
+});
+
+client.login(DISCORD_TOKEN).catch(err => {
+  console.error('Login error:', err);
+  process.exit(1);
+});
